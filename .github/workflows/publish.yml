@@ -1,0 +1,143 @@
+name: publish
+
+# Builds the constructs gem at a named version.
+#
+# constructs is the shared base library beneath aws-cdk-lib and cdk8s. Generated
+# packages pin their dependencies exactly, so every constructs version any
+# library's closure resolves has to exist as a gem — including older ones, which
+# is why the version is an input rather than "latest".
+#
+# It has no jsii dependencies of its own, so this generates it standalone: no
+# --recurse, no closure, no rosetta tablet. A run takes minutes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: constructs version to build (an exact npm version, e.g. 10.5.1)
+        required: true
+      publish:
+        description: upload the gem to the feed (otherwise this only builds it)
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # One writer for this gem at a time; the guard below is a check-then-act.
+  group: constructs-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.publish && 'production' || '' }}
+    env:
+      BUCKET: aws-cdk-ruby-gems
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the Ruby target
+        uses: actions/checkout@v4
+        with:
+          repository: omarqureshi/jsii-target-ruby
+          ref: main
+          path: plugin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Bootstrap toolchain
+        uses: omarqureshi/jsii-target-ruby/.github/actions/bootstrap-toolchain@main
+        with:
+          plugin-path: plugin
+
+      - name: Install constructs
+        run: |
+          mkdir -p work && cd work
+          npm init -y > /dev/null
+          npm install --save-exact "constructs@${VERSION}"
+          resolved=$(node -p "require('$PWD/node_modules/constructs/package.json').version")
+          [ "$resolved" = "$VERSION" ] \
+            || { echo "::error::asked for ${VERSION}, npm resolved ${resolved}"; exit 1; }
+          echo "installed constructs ${resolved}"
+
+      - name: Generate the gem
+        env:
+          JSII_RUBY_TARGET_CONFIG: ${{ github.workspace }}/config/profile.json
+          # Matches how the libraries that depend on this gem are built, so the
+          # dependency each of them pins resolves to something identical in
+          # shape to what they generated against.
+          JSII_RUBY_PIN_DEPENDENCIES: exact
+        run: |
+          cd work
+          node "${GITHUB_WORKSPACE}/toolchain/jsii/packages/jsii-pacmak/bin/jsii-pacmak" \
+            --plugin "${GITHUB_WORKSPACE}/plugin" \
+            -t ruby --force-target -o dist node_modules/constructs
+          gem_file="dist/ruby/constructs-${VERSION}.gem"
+          [ -f "$gem_file" ] || { echo "::error::no $gem_file was produced"; ls -R dist; exit 1; }
+          echo "GEM_FILE=$PWD/$gem_file" >> "$GITHUB_ENV"
+
+      - name: Every generated file parses, and the gem loads
+        # A gem that installs and then raises on first require is the failure
+        # worth catching here, and it is cheap to rule out.
+        run: |
+          bad=0
+          while IFS= read -r f; do
+            ruby -c "$f" >/dev/null 2>&1 || { echo "does not parse: $f"; bad=$((bad + 1)); }
+          done < <(find work/dist/ruby -name '*.rb')
+          [ "$bad" -eq 0 ] || { echo "::error::$bad generated file(s) do not parse"; exit 1; }
+
+          export GEM_HOME="${RUNNER_TEMP}/gemhome"
+          gem install jsii-ruby-runtime --no-document \
+            --source https://rubygems.omarqureshi.net --source https://rubygems.org
+          gem install --local --no-document "$GEM_FILE"
+          ruby -e "require 'constructs'; puts 'constructs loads: ' + defined?(Constructs::Construct).to_s"
+
+      - name: Configure AWS credentials
+        if: inputs.publish
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsCDKRole
+          aws-region: us-east-1
+
+      - name: Publish, unless this version already exists
+        if: inputs.publish
+        run: |
+          # Add-only. `gem build` is not byte-reproducible, so re-uploading a
+          # published version changes the checksum the feed advertises for it
+          # and breaks `bundle install` for anyone holding it in a lockfile.
+          key="gems/constructs-${VERSION}.gem"
+          if aws s3api head-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1; then
+            echo "constructs ${VERSION} is already published; leaving it alone"
+            exit 0
+          fi
+          aws s3 cp "$GEM_FILE" "s3://$BUCKET/$key" --no-progress >/dev/null
+          aws s3api head-object --bucket "$BUCKET" --key "$key" >/dev/null \
+            || { echo "::error::upload did not land"; exit 1; }
+          echo "published constructs ${VERSION}"
+          echo "UPLOADED=true" >> "$GITHUB_ENV"
+
+      - name: Wait for the feed to advertise it
+        if: inputs.publish && env.UPLOADED == 'true'
+        run: |
+          # The site owns the index and rebuilds it on a timer; until then the
+          # gem is in the bucket but unadvertised, which is the safe order.
+          for _ in $(seq 1 75); do
+            if curl -fsS "https://rubygems.omarqureshi.net/info/constructs" 2>/dev/null \
+                 | grep -q "^${VERSION} "; then
+              echo "the feed advertises constructs ${VERSION}"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::the feed still does not advertise ${VERSION}"
+          exit 1

@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "What constructs is called in Ruby.",
+    "",
+    "constructs is nobody's product — it is the shared base library that both",
+    "aws-cdk-lib and cdk8s depend on. That is exactly why it gets its own",
+    "repository: two distribution repositories generating it under different",
+    "names would produce two incompatible gems sharing one name, and two",
+    "publishing the same version would overwrite each other's bytes and change",
+    "the checksum the feed advertises.",
+    "",
+    "This entry must stay identical to the constructs entry in aws-cdk-ruby and",
+    "cdk8s-ruby, which still generate it as part of their own closures."
+  ],
+  "constructs": {
+    "gem": "constructs",
+    "module": "Constructs"
+  }
+}
