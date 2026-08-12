@@ -1,0 +1,164 @@
+name: docs
+
+# Builds the constructs API reference and publishes it to its own version
+# prefix.
+#
+# This matters out of proportion to the library's size. `constructs` is the base
+# every other library sits on, so its types are referenced everywhere: a single
+# aws-cdk-lib class page mentions Constructs::Construct, Constructs::IConstruct
+# and Constructs::Node repeatedly, and until these pages exist every one of
+# those references is a dead end.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: constructs version to document (an exact npm version)
+        required: true
+      publish:
+        description: publish the built documentation to the site
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: constructs-docs
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.publish && 'production' || '' }}
+    env:
+      BUCKET: aws-cdk-ruby-gems
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the Ruby target
+        uses: actions/checkout@v4
+        with:
+          repository: omarqureshi/jsii-target-ruby
+          ref: main
+          path: plugin
+
+      - name: Checkout the documentation site
+        uses: actions/checkout@v4
+        with:
+          repository: omarqureshi/rubygems.omarqureshi.net
+          ref: main
+          path: site
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Bootstrap toolchain
+        uses: omarqureshi/jsii-target-ruby/.github/actions/bootstrap-toolchain@main
+        with:
+          plugin-path: plugin
+
+      - name: Install YARD + redcarpet + rouge
+        run: gem install yard redcarpet rouge --no-document
+
+      - name: Install constructs
+        run: |
+          mkdir -p work && cd work
+          npm init -y > /dev/null
+          npm install --save-exact "constructs@${VERSION}"
+          resolved=$(node -p "require('$PWD/node_modules/constructs/package.json').version")
+          [ "$resolved" = "$VERSION" ] \
+            || { echo "::error::asked for ${VERSION}, npm resolved ${resolved}"; exit 1; }
+
+      - name: Generate the Ruby sources
+        env:
+          JSII_RUBY_TARGET_CONFIG: ${{ github.workspace }}/config/profile.json
+        run: |
+          cd work
+          node "${GITHUB_WORKSPACE}/toolchain/jsii/packages/jsii-pacmak/bin/jsii-pacmak" \
+            --plugin "${GITHUB_WORKSPACE}/plugin" \
+            -t ruby --code-only --force-target -o dist node_modules/constructs
+
+      - name: Extract the published assembly, unmodified
+        # Straight out of the npm package: it carries no Ruby naming, and is not
+        # rewritten to add any. The naming comes from this repository's profile,
+        # merged in memory by the generators.
+        run: |
+          node -e "
+            const fs = require('fs'), zlib = require('zlib');
+            const dir = 'work/node_modules/constructs';
+            let a = JSON.parse(fs.readFileSync(dir + '/.jsii'));
+            if (a.schema === 'jsii/file-redirect') {
+              a = JSON.parse(zlib.gunzipSync(fs.readFileSync(dir + '/' + a.filename)));
+            }
+            fs.writeFileSync('work/constructs.jsii', JSON.stringify(a));
+            if (a.targets.ruby) { throw new Error('expected no ruby naming in the published assembly'); }
+            console.log('assembly', a.name, a.version, '— targets:', Object.keys(a.targets).join(', '));
+          "
+
+      - name: Build the documentation
+        run: |
+          OUT="${RUNNER_TEMP}/docs"
+          mkdir -p "$OUT"
+          bash site/docs-gen/build-module-docs.sh work/dist/ruby/lib/constructs "$OUT"
+          ruby site/docs-gen/gen-module-landing.rb work/constructs.jsii "$OUT" config/profile.json
+          ruby site/docs-gen/inject-crumb.rb "$OUT"
+          # Statics read as constants, so the reference must show them that way.
+          ruby plugin/docs-gen/constantize-static-reads.rb "$OUT"
+          ruby site/docs-gen/gen-index.rb work/constructs.jsii "$OUT" config/profile.json
+          echo "DOCS_OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: The docs are under the profile's module name
+        run: |
+          test -d "$DOCS_OUT/Constructs" \
+            || { echo "::error::no Constructs/ in the built tree"; ls "$DOCS_OUT"; exit 1; }
+          echo "built $(find "$DOCS_OUT/Constructs" -name '*.html' | wc -l) pages"
+
+      - name: Upload the site
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: constructs-ruby-docs
+          path: ${{ runner.temp }}/docs
+          if-no-files-found: warn
+
+      - name: Configure AWS credentials
+        if: inputs.publish
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsCDKRole
+          aws-region: us-east-1
+
+      - name: Publish to this version's own prefix
+        if: inputs.publish
+        run: |
+          # The contract every publisher here follows: write only under
+          # docs/<Library>/<version>/, never --delete against a destination
+          # shared with other libraries, and leave the bare alias to the
+          # repository that owns the shared paths.
+          DEST="s3://$BUCKET/docs/Constructs/${VERSION}/"
+          aws s3 sync "$DOCS_OUT" "$DEST" --no-progress
+          echo "published $(aws s3 ls "$DEST" --recursive | wc -l) objects to $DEST"
+
+      - name: Ask the site to refresh its aliases and caches
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::no SITE_DISPATCH_TOKEN; the site will refresh on its schedule"
+            exit 0
+          fi
+          gh api -X POST repos/omarqureshi/rubygems.omarqureshi.net/dispatches \
+            -f event_type=docs-published \
+            -f client_payload[library]=Constructs \
+            -f client_payload[version]="$VERSION" \
+            && echo "notified the site repository" \
+            || echo "::warning::dispatch failed; the site will refresh on its schedule"
