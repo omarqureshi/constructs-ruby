@@ -59,6 +59,10 @@ jobs:
         uses: omarqureshi/jsii-target-ruby/.github/actions/bootstrap-toolchain@main
         with:
           plugin-path: plugin
+          # Requiring a generated gem is not a plain load: its entry point
+          # calls Jsii::Assembly.load, which starts the kernel. So the check
+          # below needs a runtime, not just the gems.
+          install-runtime: 'true'
 
       - name: Install constructs
         run: |
@@ -88,7 +92,9 @@ jobs:
 
       - name: Every generated file parses, and the gem loads
         # A gem that installs and then raises on first require is the failure
-        # worth catching here, and it is cheap to rule out.
+        # worth catching here, and it is cheap to rule out. Requiring it loads
+        # the assembly into a live kernel, so this exercises rather more than
+        # the syntax: JSII_RUNTIME comes from the bootstrap step above.
         run: |
           bad=0
           while IFS= read -r f; do
