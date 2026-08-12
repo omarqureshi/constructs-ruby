@@ -96,7 +96,11 @@ jobs:
           done < <(find work/dist/ruby -name '*.rb')
           [ "$bad" -eq 0 ] || { echo "::error::$bad generated file(s) do not parse"; exit 1; }
 
-          export GEM_HOME="${RUNNER_TEMP}/gemhome"
+          # Installed into the gem home setup-ruby configured, deliberately.
+          # Overriding GEM_HOME alone puts gems somewhere GEM_PATH does not
+          # list, so they install successfully and then cannot be required —
+          # which is how this failed the first time, reporting a missing gem
+          # that was sitting on disk.
           gem install jsii-ruby-runtime --no-document \
             --source https://rubygems.omarqureshi.net --source https://rubygems.org
           gem install --local --no-document "$GEM_FILE"
