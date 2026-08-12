@@ -138,10 +138,18 @@ jobs:
 
       - name: Wait for the feed to advertise it
         if: inputs.publish && env.UPLOADED == 'true'
+        # Informational, not a gate. The gem is published by the step above;
+        # this only reports how long it takes to become visible.
+        continue-on-error: true
         run: |
-          # The site owns the index and rebuilds it on a timer; until then the
-          # gem is in the bucket but unadvertised, which is the safe order.
-          for _ in $(seq 1 75); do
+          # The site owns the index. A cross-repository dispatch would refresh
+          # it in seconds, but that needs a token with access there
+          # (SITE_DISPATCH_TOKEN); without one it happens on the site's
+          # schedule — and GitHub throttles schedules on quiet repositories
+          # hard, observed at roughly 80 minutes rather than the 20 the cron
+          # asks for. So this waits a while and then stops caring, rather than
+          # failing a publish that succeeded.
+          for _ in $(seq 1 30); do
             if curl -fsS "https://rubygems.omarqureshi.net/info/constructs" 2>/dev/null \
                  | grep -q "^${VERSION} "; then
               echo "the feed advertises constructs ${VERSION}"
@@ -149,5 +157,4 @@ jobs:
             fi
             sleep 20
           done
-          echo "::error::the feed still does not advertise ${VERSION}"
-          exit 1
+          echo "::warning::constructs ${VERSION} is published but not yet advertised; the site will pick it up on its next refresh, or run that workflow by hand"
