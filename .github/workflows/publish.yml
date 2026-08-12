@@ -136,6 +136,22 @@ jobs:
           echo "published constructs ${VERSION}"
           echo "UPLOADED=true" >> "$GITHUB_ENV"
 
+      - name: Ask the site to reindex
+        if: inputs.publish && env.UPLOADED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::no SITE_DISPATCH_TOKEN; the site will refresh on its schedule"
+            exit 0
+          fi
+          gh api -X POST repos/omarqureshi/rubygems.omarqureshi.net/dispatches \
+            -f event_type=gems-published \
+            -f client_payload[library]=constructs \
+            -f client_payload[version]="$VERSION" \
+            && echo "notified the site repository" \
+            || echo "::warning::dispatch failed; the site will refresh on its schedule"
+
       - name: Wait for the feed to advertise it
         if: inputs.publish && env.UPLOADED == 'true'
         # Informational, not a gate. The gem is published by the step above;
